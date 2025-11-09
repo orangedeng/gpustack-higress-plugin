@@ -1,0 +1,13 @@
+apiVersion: extensions.higress.io/v1alpha1
+kind: WasmPlugin
+metadata:
+  name: gpustack-token-usage
+  namespace: higress-system
+spec:
+  defaultConfig:
+    realIPToHeader: x-gpustack-real-ip
+  defaultConfigDisable: false
+  failStrategy: FAIL_OPEN
+  priority: 910
+  url: http://localhost:8080/wasm-plugins/gpustack-token-usage/1.0.0/plugin.wasm
+status: {}

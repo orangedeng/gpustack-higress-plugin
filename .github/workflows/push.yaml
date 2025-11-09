@@ -1,0 +1,31 @@
+name: Build and Release Plugins
+
+on:
+  push:
+    tags:
+      - '*'
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build all plugins
+        run: |
+          set -e
+          for dir in extensions/*; do
+            if [ -d "$dir" ]; then
+              plugin=$(basename "$dir")
+              make build PLUGIN_NAME=$plugin
+              tar -czf "${plugin}.tar.gz" -C "$dir" plugin.wasm
+            fi
+          done
+
+      - name: Upload instarelease assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "*.tar.gz"
