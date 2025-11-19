@@ -6,6 +6,9 @@ import (
 	"math"
 	"net"
 	"net/url"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/higress-group/proxy-wasm-go-sdk/proxywasm"
@@ -23,6 +26,7 @@ const (
 
 // Constants for context keys
 const (
+	IsStreamingResponse        = "is_streaming_response"
 	StatisticsRequestStartTime = "gpustack_request_start_time"
 	StatisticsFirstTokenTime   = "gpustack_first_token_time"
 	TimeToFirstTokenDuration   = "gpustack_llm_first_token_duration"
@@ -38,6 +42,8 @@ func init() {
 		wrapper.ParseConfig(parseConfig),
 		// Set custom function for processing request headers
 		wrapper.ProcessRequestHeaders(onHttpRequestHeaders),
+		// Set custom function for processing response headers
+		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
 		// Set custom function for processing streaming response body
 		wrapper.ProcessStreamingResponseBody(onStreamingResponseBody),
 	)
@@ -133,6 +139,75 @@ func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Ac
 	return types.ActionContinue
 }
 
+func isStreamingResponse(headers map[string][]string) bool {
+	// Transfer-Encoding: chunked
+	if tes, ok := headers["transfer-encoding"]; ok {
+		for _, te := range tes {
+			if strings.ToLower(te) == "chunked" {
+				return true
+			}
+		}
+	}
+
+	// Content-Type 检查
+	if cts, ok := headers["content-type"]; ok {
+		for _, contentType := range cts {
+			ct := strings.ToLower(contentType)
+			if strings.Contains(ct, "text/event-stream") ||
+				strings.Contains(ct, "application/stream+json") ||
+				(strings.Contains(ct, "text/plain") && hasHeaderValue(headers, "x-stream", "true")) {
+				return true
+			}
+		}
+	}
+
+	// 没有 Content-Length 且状态码为 2xx 且不是 204/304
+	if _, hasContentLength := headers["content-length"]; !hasContentLength {
+		statusCodes := headers[":status"]
+		for _, codeStr := range statusCodes {
+			statusCode, err := strconv.Atoi(codeStr)
+			if err == nil && statusCode != 204 && statusCode != 304 && statusCode >= 200 && statusCode < 300 {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// 判断 header 某 key 是否包含某 value
+func hasHeaderValue(headers map[string][]string, key, value string) bool {
+	if vs, ok := headers[strings.ToLower(key)]; ok {
+		for _, v := range vs {
+			if strings.ToLower(v) == strings.ToLower(value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Action {
+	_, ok := ctx.GetContext(StatisticsRequestStartTime).(int64)
+	if !ok {
+		return types.ActionContinue
+	}
+	responseHeaders, err := proxywasm.GetHttpResponseHeaders()
+	if err != nil {
+		proxywasm.LogDebugf("failed to get response headers, %v", err)
+		return types.ActionContinue
+	}
+	headerMap := convertHeaders(responseHeaders)
+	isStreaming := isStreamingResponse(headerMap)
+	ctx.SetContext(IsStreamingResponse, isStreaming)
+	if !isStreaming {
+		// replace header in body modification
+		ctx.SetContext("headers", headerMap)
+		return types.HeaderStopIteration
+	}
+	return types.ActionContinue
+}
+
 // Requires to calculate time_to_first_token_ms, time_per_output_token_ms and tokens_per_second.
 func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data []byte, endOfStream bool) []byte {
 	// Get requestStartTime from http context
@@ -173,23 +248,31 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data 
 		tokensPerSecond = float64(usage.OutputToken) / (float64(outputTokenDuration) / 1000)
 	}
 
-	chunks := bytes.SplitSeq(wrapper.UnifySSEChunk(data), []byte("\n\n"))
-	var rtn = [][]byte{}
-	for chunk := range chunks {
-		proxywasm.LogDebugf("chunk data: %s", string(chunk))
-		data := bytes.TrimPrefix(chunk, []byte("data: "))
-		result := gjson.GetBytes(data, "usage")
-		// find the usage chunk
-		if !result.Exists() {
-			rtn = append(rtn, data)
-			continue
-		}
+	isStreamingResponse := ctx.GetBoolContext(IsStreamingResponse, false)
 
-		modified := process_data_with_token(data, timeToFirstTokenDuration, timePerOutputToken, tokensPerSecond)
-		rtn = append(rtn, append([]byte("data: "), modified...))
+	if isStreamingResponse {
+		chunks := bytes.SplitSeq(wrapper.UnifySSEChunk(data), []byte("\n\n"))
+		var rtn = [][]byte{}
+		for chunk := range chunks {
+			proxywasm.LogDebugf("chunk data: %s", string(chunk))
+			data := bytes.TrimPrefix(chunk, []byte("data: "))
+			result := gjson.GetBytes(data, "usage")
+			// find the usage chunk
+			if !result.Exists() {
+				rtn = append(rtn, data)
+				continue
+			}
+
+			modified := process_data_with_token(data, timeToFirstTokenDuration, timePerOutputToken, tokensPerSecond)
+			rtn = append(rtn, append([]byte("data: "), modified...))
+		}
+		return bytes.Join(rtn, []byte("\n\n"))
+	} else {
+		new_data := process_data_with_token(data, timeToFirstTokenDuration, timePerOutputToken, tokensPerSecond)
+		_ = proxywasm.ReplaceHttpResponseHeader("content-length", strconv.Itoa(len(new_data)))
+		return new_data
 	}
 
-	return bytes.Join(rtn, []byte("\n\n"))
 }
 
 func process_data_with_token(data []byte, ttft int64, tpot, tps float64) []byte {
@@ -212,4 +295,28 @@ func process_data_with_token(data []byte, ttft int64, tpot, tps float64) []byte 
 		rtn = new_data
 	}
 	return []byte(rtn)
+}
+
+// headers: [][2]string -> map[string][]string
+func convertHeaders(hs [][2]string) map[string][]string {
+	ret := make(map[string][]string)
+	for _, h := range hs {
+		k, v := strings.ToLower(h[0]), h[1]
+		ret[k] = append(ret[k], v)
+	}
+	return ret
+}
+
+// headers: map[string][]string -> [][2]string
+func reconvertHeaders(hs map[string][]string) [][2]string {
+	var ret [][2]string
+	for k, vs := range hs {
+		for _, v := range vs {
+			ret = append(ret, [2]string{k, v})
+		}
+	}
+	sort.SliceStable(ret, func(i, j int) bool {
+		return ret[i][0] < ret[j][0]
+	})
+	return ret
 }
