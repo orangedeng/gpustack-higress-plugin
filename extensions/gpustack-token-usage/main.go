@@ -6,7 +6,6 @@ import (
 	"math"
 	"net"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -56,13 +55,13 @@ type PluginConfig struct {
 }
 
 func (c *PluginConfig) shouldProcess(targetURI string) bool {
-	// 校验 targetURI 是否为合法 URI
+	// check target uri is vaild or not
 	u, err := url.ParseRequestURI(targetURI)
 	if err != nil {
 		proxywasm.LogDebugf("shouldProcess: invalid targetURI: %s", targetURI)
 		return false
 	}
-	// 只判断 Path 后缀
+	// filterred by path suffix
 	path := u.Path
 	for _, suffix := range c.EnableOnPathSuffix {
 		if len(suffix) > 0 && len(path) >= len(suffix) && path[len(path)-len(suffix):] == suffix {
@@ -149,7 +148,7 @@ func isStreamingResponse(headers map[string][]string) bool {
 		}
 	}
 
-	// Content-Type 检查
+	// Check for Content-Type
 	if cts, ok := headers["content-type"]; ok {
 		for _, contentType := range cts {
 			ct := strings.ToLower(contentType)
@@ -161,7 +160,7 @@ func isStreamingResponse(headers map[string][]string) bool {
 		}
 	}
 
-	// 没有 Content-Length 且状态码为 2xx 且不是 204/304
+	// If there is no Content-Length and status code is 2xx (except 204/304)
 	if _, hasContentLength := headers["content-length"]; !hasContentLength {
 		statusCodes := headers[":status"]
 		for _, codeStr := range statusCodes {
@@ -175,11 +174,11 @@ func isStreamingResponse(headers map[string][]string) bool {
 	return false
 }
 
-// 判断 header 某 key 是否包含某 value
+// Check if header key contains a specific value
 func hasHeaderValue(headers map[string][]string, key, value string) bool {
 	if vs, ok := headers[strings.ToLower(key)]; ok {
 		for _, v := range vs {
-			if strings.ToLower(v) == strings.ToLower(value) {
+			if strings.EqualFold(v, value) {
 				return true
 			}
 		}
@@ -201,8 +200,6 @@ func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig) types.A
 	isStreaming := isStreamingResponse(headerMap)
 	ctx.SetContext(IsStreamingResponse, isStreaming)
 	if !isStreaming {
-		// replace header in body modification
-		ctx.SetContext("headers", headerMap)
 		return types.HeaderStopIteration
 	}
 	return types.ActionContinue
@@ -279,7 +276,7 @@ func process_data_with_token(data []byte, ttft int64, tpot, tps float64) []byte 
 	var err error
 	// trim data: prefix
 	var rtn = string(bytes.TrimPrefix(data, []byte("data: ")))
-	// 保留两位小数
+	// Keep two decimal places
 	tpot = math.Round(tpot*100) / 100
 	tps = math.Round(tps*100) / 100
 	for path, value := range map[string]interface{}{
@@ -304,19 +301,5 @@ func convertHeaders(hs [][2]string) map[string][]string {
 		k, v := strings.ToLower(h[0]), h[1]
 		ret[k] = append(ret[k], v)
 	}
-	return ret
-}
-
-// headers: map[string][]string -> [][2]string
-func reconvertHeaders(hs map[string][]string) [][2]string {
-	var ret [][2]string
-	for k, vs := range hs {
-		for _, v := range vs {
-			ret = append(ret, [2]string{k, v})
-		}
-	}
-	sort.SliceStable(ret, func(i, j int) bool {
-		return ret[i][0] < ret[j][0]
-	})
 	return ret
 }
