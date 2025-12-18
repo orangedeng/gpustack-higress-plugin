@@ -238,11 +238,11 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data 
 	proxywasm.LogDebugf("onStreamingResponseBody: responseEndTime=%d, outputTokenDuration=%d, timeToFirstTokenDuration=%d", responseEndTime, outputTokenDuration, timeToFirstTokenDuration)
 	var timePerOutputToken float64 = 0
 	if usage.OutputToken > 1 {
-		timePerOutputToken = float64(outputTokenDuration) / float64(usage.OutputToken - 1)
+		timePerOutputToken = float64(outputTokenDuration) / float64(usage.OutputToken-1)
 	}
 	var tokensPerSecond float64 = 0
 	if outputTokenDuration > 0 {
-		tokensPerSecond = float64(usage.OutputToken - 1) / (float64(outputTokenDuration) / 1000)
+		tokensPerSecond = float64(usage.OutputToken-1) / (float64(outputTokenDuration) / 1000)
 	}
 
 	isStreamingResponse := ctx.GetBoolContext(IsStreamingResponse, false)
@@ -256,7 +256,7 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data 
 			result := gjson.GetBytes(data, "usage")
 			// find the usage chunk
 			if !result.Exists() {
-				rtn = append(rtn, data)
+				rtn = append(rtn, chunk)
 				continue
 			}
 
