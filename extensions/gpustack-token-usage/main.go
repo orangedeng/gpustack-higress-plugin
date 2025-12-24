@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math"
 	"net"
@@ -29,6 +30,10 @@ const (
 	StatisticsRequestStartTime = "gpustack_request_start_time"
 	StatisticsFirstTokenTime   = "gpustack_first_token_time"
 	TimeToFirstTokenDuration   = "gpustack_llm_first_token_duration"
+
+	IncompleteChunk     = "gpustack_incomplete_chunk"
+	IncompleteChunkData = "gpustack_incomplete_chunk_data"
+	UsageExtraKey       = "gpustack_usage_extra"
 )
 
 func main() {}
@@ -220,70 +225,52 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data 
 		proxywasm.LogDebugf("onStreamingResponseBody: firstTokenTime=%d, timeToFirstTokenDuration=%d", firstTokenTime, firstTokenTime-requestStartTime)
 	}
 
-	usage := tokenusage.GetTokenUsage(ctx, data)
-	if usage.TotalToken == 0 {
-		proxywasm.LogDebugf("onStreamingResponseBody: usage.TotalToken==0, return data")
+	usageExtra := getUsageExtra(ctx, data)
+	if usageExtra == nil {
 		return data
-	}
-	proxywasm.LogDebugf("onStreamingResponseBody: token usage: total=%d, output=%d", usage.TotalToken, usage.OutputToken)
-	firstTokenTime := ctx.GetContext(StatisticsFirstTokenTime).(int64)
-	if firstTokenTime == 0 {
-		proxywasm.LogDebugf("onStreamingResponseBody: firstTokenTime==0, return data")
-		return data
-	}
-
-	responseEndTime := time.Now().UnixMilli()
-	outputTokenDuration := responseEndTime - firstTokenTime
-	timeToFirstTokenDuration := ctx.GetContext(TimeToFirstTokenDuration).(int64)
-	proxywasm.LogDebugf("onStreamingResponseBody: responseEndTime=%d, outputTokenDuration=%d, timeToFirstTokenDuration=%d", responseEndTime, outputTokenDuration, timeToFirstTokenDuration)
-	var timePerOutputToken float64 = 0
-	if usage.OutputToken > 1 {
-		timePerOutputToken = float64(outputTokenDuration) / float64(usage.OutputToken-1)
-	}
-	var tokensPerSecond float64 = 0
-	if outputTokenDuration > 0 {
-		tokensPerSecond = float64(usage.OutputToken-1) / (float64(outputTokenDuration) / 1000)
 	}
 
 	isStreamingResponse := ctx.GetBoolContext(IsStreamingResponse, false)
-
+	proxywasm.LogDebugf("origin datas: %s", string(data))
 	if isStreamingResponse {
 		chunks := bytes.SplitSeq(wrapper.UnifySSEChunk(data), []byte("\n\n"))
 		var rtn = [][]byte{}
 		for chunk := range chunks {
 			proxywasm.LogDebugf("chunk data: %s", string(chunk))
 			data := bytes.TrimPrefix(chunk, []byte("data: "))
-			result := gjson.GetBytes(data, "usage")
-			// find the usage chunk
-			if !result.Exists() {
+			/***
+			In case that the chunk doesn't contained the complete json response,
+			we need to save the incomplete json and merge them togather.
+			For example:
+			1. The first frame contains data: {"xxx":111,"usage":{},"xxx":xx,"x
+			2. The second frame contains  xx":1234,"xxxx":"abcd"}
+			In the first frame, mergeLargeUsageChunks should return nil and save the data in context.
+			In the second frame, mergeLargeUsageChunks should return the complete json and remove the incomplete content in context.
+			***/
+			data = mergeLargeUsageChunks(ctx, data)
+			if data != nil && json.Valid(data) {
+				modified := process_data_with_token(data, usageExtra)
+				proxywasm.LogDebugf("modified: %s", string(modified))
+				rtn = append(rtn, append([]byte("data: "), modified...))
+				ctx.SetContext(UsageExtraKey, nil)
+			} else if data != nil {
 				rtn = append(rtn, chunk)
-				continue
 			}
-
-			modified := process_data_with_token(data, timeToFirstTokenDuration, timePerOutputToken, tokensPerSecond)
-			rtn = append(rtn, append([]byte("data: "), modified...))
 		}
 		return bytes.Join(rtn, []byte("\n\n"))
 	} else {
-		new_data := process_data_with_token(data, timeToFirstTokenDuration, timePerOutputToken, tokensPerSecond)
+		new_data := process_data_with_token(data, usageExtra)
 		_ = proxywasm.ReplaceHttpResponseHeader("content-length", strconv.Itoa(len(new_data)))
 		return new_data
 	}
 
 }
 
-func process_data_with_token(data []byte, ttft int64, tpot, tps float64) []byte {
+func process_data_with_token(data []byte, usageExtra map[string]any) []byte {
 	var err error
 	// trim data: prefix
 	var rtn = string(bytes.TrimPrefix(data, []byte("data: ")))
-	// Keep two decimal places
-	tpot = math.Round(tpot*100) / 100
-	tps = math.Round(tps*100) / 100
-	for path, value := range map[string]interface{}{
-		"time_to_first_token_ms":   ttft,
-		"time_per_output_token_ms": tpot,
-		"tokens_per_second":        tps,
-	} {
+	for path, value := range usageExtra {
 		var new_data string
 		new_data, err = sjson.Set(rtn, fmt.Sprintf("usage.%s", path), value)
 		if err != nil {
@@ -302,4 +289,72 @@ func convertHeaders(hs [][2]string) map[string][]string {
 		ret[k] = append(ret[k], v)
 	}
 	return ret
+}
+
+func getUsageExtra(ctx wrapper.HttpContext, data []byte) map[string]any {
+	// alread has extra info stored
+	var usageExtraInfo map[string]any
+	extra := ctx.GetContext(UsageExtraKey)
+	if extra != nil {
+		return extra.(map[string]any)
+	}
+	usage := tokenusage.GetTokenUsage(ctx, data)
+	if usage.TotalToken == 0 {
+		return nil
+	}
+	proxywasm.LogDebugf("onStreamingResponseBody: token usage: total=%d, output=%d", usage.TotalToken, usage.OutputToken)
+	firstTokenTime := ctx.GetContext(StatisticsFirstTokenTime).(int64)
+	if firstTokenTime == 0 {
+		return nil
+	}
+
+	responseEndTime := time.Now().UnixMilli()
+	outputTokenDuration := responseEndTime - firstTokenTime
+	timeToFirstTokenDuration := ctx.GetContext(TimeToFirstTokenDuration).(int64)
+	proxywasm.LogDebugf("onStreamingResponseBody: responseEndTime=%d, outputTokenDuration=%d, timeToFirstTokenDuration=%d", responseEndTime, outputTokenDuration, timeToFirstTokenDuration)
+	var timePerOutputToken float64 = 0
+	if usage.OutputToken > 1 {
+		timePerOutputToken = float64(outputTokenDuration) / float64(usage.OutputToken-1)
+	}
+	var tokensPerSecond float64 = 0
+	if outputTokenDuration > 0 {
+		tokensPerSecond = float64(usage.OutputToken-1) / (float64(outputTokenDuration) / 1000)
+	}
+
+	usageExtraInfo = map[string]any{
+		"time_to_first_token_ms":   timeToFirstTokenDuration,
+		"time_per_output_token_ms": math.Round(timePerOutputToken*100) / 100,
+		"tokens_per_second":        math.Round(tokensPerSecond*100) / 100,
+	}
+	ctx.SetContext(UsageExtraKey, usageExtraInfo)
+	return usageExtraInfo
+}
+
+func mergeLargeUsageChunks(ctx wrapper.HttpContext, chunk []byte) []byte {
+	// the data: prefix is removed from chunk already.
+	// the chunk must contain usage block
+	incompleteChunk := !json.Valid(chunk)
+	ctx.SetContext(IncompleteChunk, incompleteChunk)
+
+	// is valid json
+	if !ctx.GetBoolContext(IncompleteChunk, false) {
+		return chunk
+	}
+
+	// end of streaming
+	if len(bytes.TrimSpace(chunk)) == 0 {
+		ctx.SetContext(IncompleteChunk, false)
+		chunk = ctx.GetByteSliceContext(IncompleteChunkData, chunk)
+		ctx.SetContext(IncompleteChunkData, nil)
+		return chunk
+	}
+	deltaMessage := ctx.GetByteSliceContext(IncompleteChunkData, []byte{})
+	chunk = append(deltaMessage, chunk...)
+
+	if !json.Valid(chunk) {
+		ctx.SetContext(IncompleteChunkData, chunk)
+		chunk = nil
+	}
+
+	return chunk
 }
