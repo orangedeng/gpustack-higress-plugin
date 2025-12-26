@@ -332,14 +332,14 @@ func getUsageExtra(ctx wrapper.HttpContext, data []byte) map[string]any {
 
 func mergeLargeUsageChunks(ctx wrapper.HttpContext, chunk []byte) []byte {
 	// the data: prefix is removed from chunk already.
-	// the chunk must contain usage block
 	incompleteChunk := !json.Valid(chunk)
-	ctx.SetContext(IncompleteChunk, incompleteChunk)
-
-	// is valid json
-	if !ctx.GetBoolContext(IncompleteChunk, false) {
+	hasUsage := gjson.GetBytes(chunk, "usage")
+	isStoredIncomplete := ctx.GetBoolContext(IncompleteChunk, false)
+	if incompleteChunk && !hasUsage.Exists() && !isStoredIncomplete {
 		return chunk
 	}
+	// the chunk must contain usage block
+	ctx.SetContext(IncompleteChunk, true)
 
 	// end of streaming
 	if len(bytes.TrimSpace(chunk)) == 0 {
