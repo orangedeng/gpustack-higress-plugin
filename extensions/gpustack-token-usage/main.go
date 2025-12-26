@@ -34,6 +34,7 @@ const (
 	IncompleteChunk     = "gpustack_incomplete_chunk"
 	IncompleteChunkData = "gpustack_incomplete_chunk_data"
 	UsageExtraKey       = "gpustack_usage_extra"
+	ModifiedKey         = "gpustack_usage_modified"
 )
 
 func main() {}
@@ -74,7 +75,6 @@ func (c *PluginConfig) shouldProcess(targetURI string) bool {
 			return true
 		}
 	}
-	proxywasm.LogDebugf("shouldProcess: no match for path %s", path)
 	return false
 }
 
@@ -224,46 +224,55 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data 
 		ctx.SetContext(TimeToFirstTokenDuration, firstTokenTime-requestStartTime)
 		proxywasm.LogDebugf("onStreamingResponseBody: firstTokenTime=%d, timeToFirstTokenDuration=%d", firstTokenTime, firstTokenTime-requestStartTime)
 	}
-
-	usageExtra := getUsageExtra(ctx, data)
-	if usageExtra == nil {
-		return data
-	}
-
 	isStreamingResponse := ctx.GetBoolContext(IsStreamingResponse, false)
-	proxywasm.LogDebugf("origin datas: %s", string(data))
-	if isStreamingResponse {
-		chunks := bytes.SplitSeq(wrapper.UnifySSEChunk(data), []byte("\n\n"))
-		var rtn = [][]byte{}
-		for chunk := range chunks {
-			proxywasm.LogDebugf("chunk data: %s", string(chunk))
-			data := bytes.TrimPrefix(chunk, []byte("data: "))
-			/***
-			In case that the chunk doesn't contained the complete json response,
-			we need to save the incomplete json and merge them togather.
-			For example:
-			1. The first frame contains data: {"xxx":111,"usage":{},"xxx":xx,"x
-			2. The second frame contains  xx":1234,"xxxx":"abcd"}
-			In the first frame, mergeLargeUsageChunks should return nil and save the data in context.
-			In the second frame, mergeLargeUsageChunks should return the complete json and remove the incomplete content in context.
-			***/
-			data = mergeLargeUsageChunks(ctx, data)
-			if data != nil && json.Valid(data) {
-				modified := process_data_with_token(data, usageExtra)
-				proxywasm.LogDebugf("modified: %s", string(modified))
-				rtn = append(rtn, append([]byte("data: "), modified...))
-				ctx.SetContext(UsageExtraKey, nil)
-			} else if data != nil {
-				rtn = append(rtn, chunk)
-			}
+	if !isStreamingResponse {
+		// for non-stream sresponse
+		usageExtra := getUsageExtra(ctx, data)
+		if usageExtra == nil {
+			return data
 		}
-		return bytes.Join(rtn, []byte("\n\n"))
-	} else {
 		new_data := process_data_with_token(data, usageExtra)
 		_ = proxywasm.ReplaceHttpResponseHeader("content-length", strconv.Itoa(len(new_data)))
 		return new_data
 	}
 
+	chunks := bytes.SplitSeq(wrapper.UnifySSEChunk(data), []byte("\n\n"))
+	var rtn = [][]byte{}
+	for chunk := range chunks {
+		if ctx.GetBoolContext(ModifiedKey, false) {
+			rtn = append(rtn, chunk)
+			continue
+		}
+		chunk = mergeLargeUsageChunks(ctx, chunk)
+		if chunk == nil {
+			// to avoid the two chunk didn't join with \n\n
+			rtn = append(rtn, []byte(""))
+			continue
+		}
+		trimed_data := bytes.TrimPrefix(chunk, []byte("data: "))
+		if !json.Valid(trimed_data) {
+			// if is part of the json
+			rtn = append(rtn, chunk)
+			continue
+		}
+		result := gjson.GetBytes(trimed_data, "usage")
+		// no usage found
+		if !result.Exists() {
+			rtn = append(rtn, chunk)
+			continue
+		}
+		proxywasm.LogDebugf("valid chunk: %s", string(trimed_data))
+		usageExtra := getUsageExtra(ctx, trimed_data)
+		if usageExtra == nil {
+			proxywasm.LogWarnf("no usage is found in a chunk with usage bytes, chunk data is %s", string(chunk))
+			continue
+		}
+		modified := process_data_with_token(trimed_data, usageExtra)
+		proxywasm.LogDebugf("modified: %s", string(modified))
+		rtn = append(rtn, append([]byte("data: "), modified...))
+		ctx.SetContext(ModifiedKey, true)
+	}
+	return bytes.Join(rtn, []byte("\n\n"))
 }
 
 func process_data_with_token(data []byte, usageExtra map[string]any) []byte {
@@ -331,30 +340,25 @@ func getUsageExtra(ctx wrapper.HttpContext, data []byte) map[string]any {
 }
 
 func mergeLargeUsageChunks(ctx wrapper.HttpContext, chunk []byte) []byte {
-	// the data: prefix is removed from chunk already.
-	incompleteChunk := !json.Valid(chunk)
-	hasUsage := gjson.GetBytes(chunk, "usage")
-	isStoredIncomplete := ctx.GetBoolContext(IncompleteChunk, false)
-	if incompleteChunk && !hasUsage.Exists() && !isStoredIncomplete {
-		return chunk
-	}
-	// the chunk must contain usage block
-	ctx.SetContext(IncompleteChunk, true)
-
-	// end of streaming
-	if len(bytes.TrimSpace(chunk)) == 0 {
+	trimed_data := bytes.TrimPrefix(chunk, []byte("data: "))
+	if json.Valid(trimed_data) {
 		ctx.SetContext(IncompleteChunk, false)
-		chunk = ctx.GetByteSliceContext(IncompleteChunkData, chunk)
-		ctx.SetContext(IncompleteChunkData, nil)
 		return chunk
 	}
-	deltaMessage := ctx.GetByteSliceContext(IncompleteChunkData, []byte{})
-	chunk = append(deltaMessage, chunk...)
-
-	if !json.Valid(chunk) {
-		ctx.SetContext(IncompleteChunkData, chunk)
-		chunk = nil
+	// end of streaming
+	if len(bytes.TrimSpace(trimed_data)) == 0 {
+		return chunk
 	}
+	ctx.SetContext(IncompleteChunk, true)
+	deltaMessage := ctx.GetByteSliceContext(IncompleteChunkData, []byte{})
+	trimed_data = append(deltaMessage, trimed_data...)
+	proxywasm.LogDebugf("the delta is stored: %s", string(trimed_data))
 
-	return chunk
+	if !json.Valid(trimed_data) {
+		ctx.SetContext(IncompleteChunkData, trimed_data)
+		return nil
+	}
+	ctx.SetContext(IncompleteChunk, false)
+	ctx.SetContext(IncompleteChunkData, nil)
+	return append([]byte("data: "), trimed_data...)
 }
