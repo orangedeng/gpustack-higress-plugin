@@ -265,6 +265,7 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data 
 		usageExtra := getUsageExtra(ctx, trimed_data)
 		if usageExtra == nil {
 			proxywasm.LogWarnf("no usage is found in a chunk with usage bytes, chunk data is %s", string(chunk))
+			rtn = append(rtn, chunk)
 			continue
 		}
 		modified := process_data_with_token(trimed_data, usageExtra)
