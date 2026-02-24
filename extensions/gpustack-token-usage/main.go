@@ -162,6 +162,9 @@ func isStreamingResponse(headers map[string][]string) bool {
 				(strings.Contains(ct, "text/plain") && hasHeaderValue(headers, "x-stream", "true")) {
 				return true
 			}
+			if strings.Contains(ct, "application/json") {
+				return false
+			}
 		}
 	}
 
