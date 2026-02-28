@@ -8,6 +8,8 @@ This repository contains custom Higress Proxy-Wasm plugins (extensions) designed
 
 - **gpustack-token-usage**
   - Collects and injects token usage statistics into AI API streaming responses (SSE), including time to first token, average token latency, and tokens per second. Supports real client IP injection and path-based filtering. See [`extensions/gpustack-token-usage/README.md`](./extensions/gpustack-token-usage/README.md) for details.
+- **gpustack-set-header-pre-route**
+  - Automatically injects the route name and model name into HTTP request headers before routing, based on configurable path suffixes or prefixes. Useful for model service and API gateway scenarios. See [`extensions/gpustack-set-header-pre-route/README.md`](./extensions/gpustack-set-header-pre-route/README.md) for details.
 
 ## Usage
 
