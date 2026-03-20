@@ -47,6 +47,8 @@ func init() {
 		wrapper.ParseConfig(parseConfig),
 		// Set custom function for processing request headers
 		wrapper.ProcessRequestHeaders(onHttpRequestHeaders),
+		// Set custom function for processing request body
+		wrapper.ProcessRequestBody(onHttpRequestBody),
 		// Set custom function for processing response headers
 		wrapper.ProcessResponseHeaders(onHttpResponseHeaders),
 		// Set custom function for processing streaming response body
@@ -101,45 +103,101 @@ func parseConfig(json gjson.Result, config *PluginConfig) error {
 	return nil
 }
 
-func realIpHandler(_ wrapper.HttpContext, headerName string) {
+func realIpHandler(_ wrapper.HttpContext, headerName string) map[string]string {
 	var (
 		realIpStr string
 	)
 	// Get all request headers
 	if headerName == "" {
-		return
+		return nil
 	}
-	headers, err := proxywasm.GetHttpRequestHeaders()
-	if err != nil {
-		proxywasm.LogDebugf("failed to get request headers, %s", err)
-		return
-	}
+
 	data, err := proxywasm.GetProperty([]string{"source", "address"})
 	if err != nil {
 		proxywasm.LogDebugf("failed to get remote address, %s", err)
-		return
+		return nil
 	}
 	// Only keeps the host without port
 	host, _, err := net.SplitHostPort(string(data))
 	if err == nil {
 		realIpStr = host
 	}
-	headers = append(headers, [2]string{
-		headerName, realIpStr,
-	})
-	_ = proxywasm.ReplaceHttpRequestHeaders(headers)
+
+	return map[string]string{headerName: realIpStr}
 }
 
 // onHttpRequestHeaders processes the request headers and logs them if enabled
 func onHttpRequestHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Action {
-	realIpHandler(ctx, config.RealIPToHeader)
-
-	if !config.shouldProcess(ctx.Path()) {
-		return types.ActionContinue
+	action := types.ActionContinue
+	contentType, _ := proxywasm.GetHttpRequestHeader("content-type")
+	if config.shouldProcess(ctx.Path()) && contentType == "application/json" {
+		hs, err := proxywasm.GetHttpRequestHeaders()
+		if err != nil {
+			proxywasm.LogWarnf("failed to get request headers, skip handling body, %v", err)
+			return action
+		}
+		// request start time is used by Time to First Token
+		ctx.SetContext(StatisticsRequestStartTime, time.Now().UnixMilli())
+		// only read the body if content-type is application/json
+		ctx.SetContext("headers", hs)
+		action = types.HeaderStopIteration
 	}
 
-	ctx.SetContext(StatisticsRequestStartTime, time.Now().UnixMilli())
+	if action == types.ActionContinue {
+		headers := realIpHandler(ctx, config.RealIPToHeader)
+		for key, value := range headers {
+			_ = proxywasm.AddHttpRequestHeader(key, value)
+		}
+		ctx.DontReadRequestBody()
+	}
+	return action
+}
 
+func removeHeader(name string, headers [][2]string) [][2]string {
+	var rtn = [][2]string{}
+	for _, value := range headers {
+		if strings.EqualFold(value[0], name) {
+			continue
+		}
+		rtn = append(rtn, value)
+	}
+	return rtn
+}
+
+// onHttpRequestBody is called if the request is openai completions API like /v1/chat/completions
+func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte) types.Action {
+	proxywasm.LogDebug("processing request body")
+	headers, ok := ctx.GetContext("headers").([][2]string)
+	if !ok {
+		proxywasm.LogWarn("failed to get headers from context, skip process body")
+		return types.ActionContinue
+	}
+	ipHeaders := realIpHandler(ctx, config.RealIPToHeader)
+	for key, value := range ipHeaders {
+		headers = append(headers, [2]string{key, value})
+	}
+	stream := gjson.GetBytes(body, "stream")
+	includeUsage := gjson.GetBytes(body, "stream_options.include_usage")
+	if stream.Exists() && stream.Bool() && !includeUsage.Exists() {
+		proxywasm.LogDebug("setting include_usage to request body")
+		newBody, err := sjson.SetBytes(body, "stream_options.include_usage", true)
+		if err != nil {
+			proxywasm.LogErrorf("failed to set json body, %v", err)
+		} else if err := proxywasm.ReplaceHttpRequestBody(newBody); err != nil {
+			// replace body failed
+			proxywasm.LogWarnf("failed to replace new body %s, %v", string(newBody), err)
+		} else {
+			// set succeed and replace succeed
+			headers = removeHeader("content-length", headers)
+		}
+	} else {
+		proxywasm.LogDebug("no need to modify request body")
+		if includeUsage.Exists() && !includeUsage.Bool() {
+			// specify not to include usage
+			ctx.SetContext(StatisticsRequestStartTime, nil)
+		}
+	}
+	_ = proxywasm.ReplaceHttpRequestHeaders(headers)
 	return types.ActionContinue
 }
 
