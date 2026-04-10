@@ -35,6 +35,8 @@ const (
 	IncompleteChunkData = "gpustack_incomplete_chunk_data"
 	UsageExtraKey       = "gpustack_usage_extra"
 	ModifiedKey         = "gpustack_usage_modified"
+	SeenUsageChunk      = "gpustack_seen_usage_chunk"
+	ProcessedUsageChunk = "gpustack_processed_usage_chunk"
 )
 
 func main() {}
@@ -93,6 +95,7 @@ func parseConfig(json gjson.Result, config *PluginConfig) error {
 		path := suffix.String()
 		if _, err := url.ParseRequestURI(path); err != nil {
 			proxywasm.LogDebugf("onParseConfig: %s is not a valid uri, skipping", path)
+			continue
 		}
 		defaultSuffixes[path] = true
 	}
@@ -119,9 +122,11 @@ func realIpHandler(_ wrapper.HttpContext, headerName string) map[string]string {
 	}
 	// Only keeps the host without port
 	host, _, err := net.SplitHostPort(string(data))
-	if err == nil {
-		realIpStr = host
+	if err != nil {
+		proxywasm.LogDebugf("failed to split host:port, %s", err)
+		return nil
 	}
+	realIpStr = host
 
 	return map[string]string{headerName: realIpStr}
 }
@@ -177,6 +182,7 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 		headers = append(headers, [2]string{key, value})
 	}
 	stream := gjson.GetBytes(body, "stream")
+	ctx.SetContext(IsStreamingResponse, stream.Exists() && stream.Bool())
 	includeUsage := gjson.GetBytes(body, "stream_options.include_usage")
 	if stream.Exists() && stream.Bool() && !includeUsage.Exists() {
 		proxywasm.LogDebug("setting include_usage to request body")
@@ -201,74 +207,23 @@ func onHttpRequestBody(ctx wrapper.HttpContext, config PluginConfig, body []byte
 	return types.ActionContinue
 }
 
-func isStreamingResponse(headers map[string][]string) bool {
-	// Transfer-Encoding: chunked
-	if tes, ok := headers["transfer-encoding"]; ok {
-		for _, te := range tes {
-			if strings.ToLower(te) == "chunked" {
-				return true
-			}
-		}
-	}
-
-	// Check for Content-Type
-	if cts, ok := headers["content-type"]; ok {
-		for _, contentType := range cts {
-			ct := strings.ToLower(contentType)
-			if strings.Contains(ct, "text/event-stream") ||
-				strings.Contains(ct, "application/stream+json") ||
-				(strings.Contains(ct, "text/plain") && hasHeaderValue(headers, "x-stream", "true")) {
-				return true
-			}
-			if strings.Contains(ct, "application/json") {
-				return false
-			}
-		}
-	}
-
-	// If there is no Content-Length and status code is 2xx (except 204/304)
-	if _, hasContentLength := headers["content-length"]; !hasContentLength {
-		statusCodes := headers[":status"]
-		for _, codeStr := range statusCodes {
-			statusCode, err := strconv.Atoi(codeStr)
-			if err == nil && statusCode != 204 && statusCode != 304 && statusCode >= 200 && statusCode < 300 {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-// Check if header key contains a specific value
-func hasHeaderValue(headers map[string][]string, key, value string) bool {
-	if vs, ok := headers[strings.ToLower(key)]; ok {
-		for _, v := range vs {
-			if strings.EqualFold(v, value) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 func onHttpResponseHeaders(ctx wrapper.HttpContext, config PluginConfig) types.Action {
 	_, ok := ctx.GetContext(StatisticsRequestStartTime).(int64)
 	if !ok {
 		return types.ActionContinue
 	}
-	responseHeaders, err := proxywasm.GetHttpResponseHeaders()
-	if err != nil {
-		proxywasm.LogDebugf("failed to get response headers, %v", err)
+	isStreaming := ctx.GetBoolContext(IsStreamingResponse, false)
+	if isStreaming {
+		// Edge case: request said stream=true, but server responded with non-streaming JSON (e.g., error)
+		// Trust the response content-type over the request parameter
+		contentType, _ := proxywasm.GetHttpResponseHeader("content-type")
+		if strings.Contains(contentType, "application/json") {
+			ctx.SetContext(IsStreamingResponse, false)
+			return types.HeaderStopIteration
+		}
 		return types.ActionContinue
 	}
-	headerMap := convertHeaders(responseHeaders)
-	isStreaming := isStreamingResponse(headerMap)
-	ctx.SetContext(IsStreamingResponse, isStreaming)
-	if !isStreaming {
-		return types.HeaderStopIteration
-	}
-	return types.ActionContinue
+	return types.HeaderStopIteration
 }
 
 // Requires to calculate time_to_first_token_ms, time_per_output_token_ms and tokens_per_second.
@@ -322,19 +277,25 @@ func onStreamingResponseBody(ctx wrapper.HttpContext, config PluginConfig, data 
 			rtn = append(rtn, chunk)
 			continue
 		}
+		ctx.SetContext(SeenUsageChunk, true)
 		proxywasm.LogDebugf("valid chunk: %s", string(trimed_data))
 		usageExtra := getUsageExtra(ctx, trimed_data)
 		if usageExtra == nil {
-			proxywasm.LogWarnf("no usage is found in a chunk with usage bytes, chunk data is %s", string(chunk))
 			rtn = append(rtn, chunk)
 			continue
 		}
+		ctx.SetContext(ProcessedUsageChunk, true)
 		modified := process_data_with_token(trimed_data, usageExtra)
 		proxywasm.LogDebugf("modified: %s", string(modified))
 		rtn = append(rtn, append([]byte("data: "), modified...))
 		ctx.SetContext(ModifiedKey, true)
 	}
-	return bytes.Join(rtn, []byte("\n\n"))
+	result := bytes.Join(rtn, []byte("\n\n"))
+	// At the end of stream, log if we saw usage chunks but failed to process any
+	if endOfStream && ctx.GetBoolContext(SeenUsageChunk, false) && !ctx.GetBoolContext(ProcessedUsageChunk, false) {
+		proxywasm.LogWarnf("no usage is found in any chunk with usage bytes")
+	}
+	return result
 }
 
 func process_data_with_token(data []byte, usageExtra map[string]any) []byte {
@@ -350,16 +311,6 @@ func process_data_with_token(data []byte, usageExtra map[string]any) []byte {
 		rtn = new_data
 	}
 	return []byte(rtn)
-}
-
-// headers: [][2]string -> map[string][]string
-func convertHeaders(hs [][2]string) map[string][]string {
-	ret := make(map[string][]string)
-	for _, h := range hs {
-		k, v := strings.ToLower(h[0]), h[1]
-		ret[k] = append(ret[k], v)
-	}
-	return ret
 }
 
 func getUsageExtra(ctx wrapper.HttpContext, data []byte) map[string]any {
