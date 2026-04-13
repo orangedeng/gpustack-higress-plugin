@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ========== Go Tests ==========
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: extensions/*/go.sum
+
+      - name: Run Go tests
+        run: make test
+
+      # ========== Python Lint ==========
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Run lint (with auto-fix)
+        run: make lint
+
+      # ========== Check for uncommitted changes ==========
+      - name: Check for uncommitted changes
+        run: make check-dirty
+
+      # ========== Build whl ==========
+      - name: Build whl package
+        run: make build
+
+      - name: Verify build artifacts
+        run: |
+          echo "Checking build artifacts..."
+          ls -lh dist/
+
+          # Verify whl exists
+          if [ ! -f dist/*.whl ]; then
+            echo "Error: No whl file found in dist/"
+            exit 1
+          fi
+
+          # Verify tar.gz exists
+          if [ ! -f dist/*.tar.gz ]; then
+            echo "Error: No tar.gz file found in dist/"
+            exit 1
+          fi
+
+          echo "✓ Build artifacts verified"
