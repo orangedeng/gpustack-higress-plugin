@@ -12,8 +12,7 @@ BUILD_FLAGS := -buildmode=c-shared
 # Output directory for built WASM files
 # Use absolute path to ensure consistency regardless of where Makefile is called from
 EXTENSIONS_DIR := $(shell pwd)
-OUTPUT_DIR := $(EXTENSIONS_DIR)/../gpustack_higress_plugins/plugins
-OUTPUT_DIR := $(shell cd $(OUTPUT_DIR) && pwd)  # Convert to absolute path
+OUTPUT_DIR := $(abspath $(EXTENSIONS_DIR)/../gpustack_higress_plugins/plugins)
 
 # Remote plugins configuration file
 REMOTE_PLUGINS_CONFIG := remote_plugins.yaml
