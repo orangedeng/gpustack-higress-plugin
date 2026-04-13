@@ -4,44 +4,143 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Higress Proxy-Wasm plugins for GPUStack, targeting AI API traffic processing and observability. Each plugin under `extensions/` is a standalone Go module compiled to WebAssembly (`plugin.wasm`) and deployed to Higress-compatible gateways.
+**GPUStack Higress Plugins** - A Python package that distributes Higress Proxy-Wasm plugins for GPUStack, with a FastAPI-based HTTP server for serving them.
 
-## Build Commands
+- **Go plugins** in `extensions/` - Compiled to WebAssembly (`.wasm`) for Higress
+- **Python package** `gpustack_higress_plugins/` - FastAPI server that serves the built `.wasm` files
+- **Remote plugins** - Support fetching plugins from OCI registries (oras)
+
+## Common Commands
+
+### Setup
 
 ```bash
-# Build a specific plugin (outputs extensions/<plugin>/plugin.wasm)
-make build PLUGIN_NAME=gpustack-token-usage
-make build PLUGIN_NAME=gpustack-set-header-pre-route
-
-# Build and push Docker image
-make build-push PLUGIN_NAME=<plugin-name>
-
-# Local build (no Docker, outputs main.wasm)
-make local-build PLUGIN_NAME=<plugin-name>
+make venv         # Create .venv with python3 -m venv (NOT uv venv)
+make install      # Install deps with uv sync --extra dev
+make dev          # install + optional pre-commit hooks
 ```
 
-Build uses Docker with a specialized WASM Go builder image (`higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins/wasm-go-builder`). The WASM compilation target is `GOOS=wasip1 GOARCH=wasm` with `-buildmode=c-shared`.
-
-## Testing
+### Build
 
 ```bash
-# Run tests for a specific plugin
-cd extensions/<plugin-name> && go test ./...
+make build        # Build all Go plugins + generate manifest + build Python wheel (uv build)
+make build-docker # Build wheel via Docker (for environments without Go toolchain)
+make clean        # Remove all build artifacts including dist/ and uv.lock
+```
+
+### Go Plugins (run from repo root or via -C)
+
+```bash
+make -C extensions build PLUGIN_NAME=<name>   # Build single plugin
+make -C extensions build-all                   # Build all local plugins
+make -C extensions build-all-with-remote       # Build local + fetch remote plugins
+make -C extensions watch PLUGIN_NAME=<name>    # Watch + rebuild (requires: brew install fswatch)
+make -C extensions list                        # List local plugins with versions
+make -C extensions list-remote                 # List remote plugins from remote_plugins.yaml
+```
+
+### Testing
+
+```bash
+make test                                          # Run all Go plugin tests
+make -C extensions test PLUGIN_NAME=<name>         # Test single plugin (go test -v ./...)
+make -C extensions test-all                        # Test all plugins (stops on first failure)
+```
+
+### Lint and Format
+
+```bash
+make lint         # ruff check (rules: E, F, I, N, W; ignores E501) on gpustack_higress_plugins/ and scripts/
+make format       # ruff check --fix + ruff format
+make check-dirty  # Verify no uncommitted changes (used in CI)
+```
+
+### Docker
+
+```bash
+make image        # Build Docker image
+make push         # Push to registry
 ```
 
 ## Architecture
 
-- **Plugin model**: Each plugin in `extensions/` is an independent Go module with its own `go.mod`, `VERSION`, and `README.md`.
-- **SDK dependencies**: All plugins use `github.com/higress-group/proxy-wasm-go-sdk` and `github.com/higress-group/wasm-go` (Higress's Go SDK for Wasm plugins). The `wasm-go/pkg/wrapper` package provides the plugin framework.
-- **JSON handling**: `tidwall/gjson` and `tidwall/sjson` for JSON parsing/manipulation in Wasm context.
-- **Plugin lifecycle**: Plugins implement `wrapper.ProcessRequestHeaders`, `wrapper.ProcessRequestBody`, `wrapper.ProcessResponseHeaders`, and `wrapper.ProcessResponseBody` callbacks.
-- **Streaming**: SSE (Server-Sent Events) responses are handled by buffering and parsing chunked data across multiple `ProcessResponseBody` calls.
+### Python Package (`gpustack_higress_plugins/`)
 
-## CI/CD
+- `main.py` - CLI entry point (`gpustack-plugins`), FastAPI app factory (`create_app`, `app`, `start_server`)
+- `server.py` - APIRouter at prefix `/plugins` with endpoints:
+  - `GET /plugins/{name}/{version}/plugin.wasm`
+  - `GET /plugins/{name}/{version}/metadata.txt`
+- `plugins/` - Built `.wasm` + `metadata.txt` files (generated, not in git)
+- `manifest.json` - Generated plugin index (not in git)
 
-Tag pushes trigger `.github/workflows/push.yaml` which builds all plugins, pushes Docker images, and creates GitHub releases with `.tar.gz` archives of each `plugin.wasm`.
+**CLI flags**: `gpustack-plugins start --port 8080 --host 0.0.0.0 --log-level [critical|error|warning|info|debug]`
 
-## Available Plugins
+**Importing**: `from gpustack_higress_plugins import router, create_app` (embed in another FastAPI app)
 
-- **gpustack-token-usage**: Collects token usage stats from AI API streaming responses (TTFT, avg token latency, tokens/sec). Injects real client IP. Configurable path filtering.
-- **gpustack-set-header-pre-route**: Injects route name and cluster/model name into request headers before routing. Path-based filtering via suffixes and prefixes.
+### Go Plugins (`extensions/`)
+
+Each plugin is an independent Go module with `main.go`, `go.mod`, `VERSION`. All modules are listed in `go.work`.
+
+- **Build target**: `GOOS=wasip1 GOARCH=wasm -buildmode=c-shared`
+- **Go version**: 1.24.4
+- **Key deps**: `proxy-wasm-go-sdk`, `higress-group/wasm-go`, `tidwall/gjson`, `tidwall/sjson`
+
+The `metadata.txt` (Higress standard) is generated by `scripts/generate_metadata.py` with name, size, timestamps, and MD5.
+
+### Scripts (`scripts/`)
+
+- `generate_metadata.py` - Creates `metadata.txt` per plugin
+- `generate_manifest.py` - Scans `plugins/` + `remote_plugins.yaml` → `manifest.json`
+- `fetch_remote_plugins.py` - Pulls OCI plugins via oras
+
+### Version Management
+
+- **Package version**: `pyproject.toml` is the single source of truth (all plugins share this version)
+- **Plugin version**: `extensions/<name>/VERSION` file (individual version string, e.g., `1.0.0`)
+- Version read directly from `pyproject.toml` at runtime (no `importlib.metadata`)
+
+## Plugin Details
+
+### gpustack-token-usage
+
+Collects token usage stats from AI API responses. Key non-obvious behaviors:
+
+- Streaming detection uses `stream` field from **request body** (not response `Content-Type`)
+- Auto-injects `stream_options.include_usage: true` into request body when needed
+- If request has `stream: true` but response `Content-Type: application/json`, treats as non-streaming
+
+Config fields: `realIPToHeader`, `enableOnPathSuffix`
+
+### gpustack-set-header-pre-route
+
+Injects route/cluster name into request headers **before** routing (pre-route phase).
+
+Config fields: `routeNameHeader`, `clusterNameHeader`, `enableOnPathSuffix`, `enableOnPathPrefix`
+
+## Remote Plugins
+
+Configured in `extensions/remote_plugins.yaml`. Require `oras` (`brew install oras`).
+
+```yaml
+default_registry: higress-registry.cn-hangzhou.cr.aliyuncs.com/plugins
+remote_plugins:
+  - source: ai-proxy:2.0.0    # uses default_registry
+    name: ai-proxy
+    version: 2.0.0
+    digest: sha256:...         # optional, for pinning
+  - source: oci://ghcr.io/higress-extensions/jwt-auth:1.1.0  # full OCI URL
+    name: jwt-auth
+    version: 1.1.0
+```
+
+Remote plugins are automatically fetched during Docker build. In local dev, build from source.
+
+## Adding a New Plugin
+
+1. Create `extensions/new-plugin/` with `main.go`, `go.mod`, `VERSION`
+2. Add to `go.work` under the `use ()` directive
+3. `make build`
+
+## CI
+
+CI (`.github/workflows/ci.yaml`) runs on push to main/develop and on PRs: Go 1.24 + Python 3.11, `make test` → `make lint` → `make check-dirty` → `make build`, verifies `.whl` and `.tar.gz` in `dist/`.
